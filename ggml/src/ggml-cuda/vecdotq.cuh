@@ -569,22 +569,16 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1_impl_vmmq(
     float sumf_m = 0.0f;
 
 #pragma unroll
-    for (int i = 0; i < QR5_K; ++i) {
-        const int vl0i = (vl[0] >> (4*i)) & 0x0F0F0F0F;
-        const int vl1i = (vl[1] >> (4*i)) & 0x0F0F0F0F;
+    for (int i = 0; i < 2*QR5_K; ++i) {
+        const int vl_i = (vl[i/2] >> (4*(i%2))) & 0x0F0F0F0F;
+        const int vh_i = ((vh[i/2] >> (i%2)) << 4) & 0x10101010;
+        const int v_i  = vl_i | vh_i;
 
-        const int vh0i = ((vh[0] >> i) << 4) & 0x10101010;
-        const int vh1i = ((vh[1] >> i) << 4) & 0x10101010;
-
-        const int v0i = vl0i | vh0i;
-        const int v1i = vl1i | vh1i;
-
-        const int dot1 = ggml_cuda_dp4a(v0i, u[2*i+0], ggml_cuda_dp4a(v1i, u[2*i+1], 0)); // SIMD dot product
-        const int dot2 = ggml_cuda_dp4a(0x01010101, u[2*i+0], ggml_cuda_dp4a(0x01010101, u[2*i+1], 0)); // sum of u
+        const int dot1 = ggml_cuda_dp4a(v_i, u[i], 0); // SIMD dot product
+        const int dot2 = ggml_cuda_dp4a(0x01010101, u[i], 0); // sum of u
 
         sumf_d += d8[i] * (dot1 * sc[i]);
         sumf_m += d8[i] * (dot2 * m[i]);
-
     }
 
     const float2 dm5f = __half22float2(dm5);
@@ -961,39 +955,42 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1(
     int   vl[2];
     int   vh[2];
     int    u[2*QR5_K];
-    float d8[QR5_K];
+    float d8[2*QR5_K];
 
-    const int bq8_offset = QR5_K * ((iqs/2) / (QI8_1/2));
-    const int * ql = (const int *)(bq5_K->qs + 16 * bq8_offset + 4 * ((iqs/2)%4));
-    const int * qh = (const int *)(bq5_K->qh + 4 * ((iqs/2)%4));
+    // lane index within the half-warp (0..15)
+    const int L = iqs/2;
+    const int g = L/8; // 64-element group (0 or 1)
+    const int r = L%8; // lane within the group (0..7)
 
-    vl[0] = ql[0];
-    vl[1] = ql[4];
+    // contiguous qs reads: this half-warp covers qs[0..63] with the first word and qs[64..127] with the second
+    vl[0] = ((const int *) bq5_K->qs)[L];
+    vl[1] = ((const int *) bq5_K->qs)[16 + L];
 
-    vh[0] = qh[0] >> bq8_offset;
-    vh[1] = qh[4] >> bq8_offset;
+    // sub-blocks {2g, 2g+1, 2g+4, 2g+5} take their high bits from qh bytes [4*r, 4*r+4)
+    const int qh0 = ((const int *) bq5_K->qh)[r];
+    vh[0] = qh0 >> (2*g + 0);
+    vh[1] = qh0 >> (2*g + 4);
 
-    const uint16_t * scales = (const uint16_t *)bq5_K->scales;
-    uint16_t aux[2];
-    const int j = bq8_offset/2;
-    if (j < 2) {
-        aux[0] = scales[j+0] & 0x3f3f;
-        aux[1] = scales[j+2] & 0x3f3f;
-    } else {
-        aux[0] = ((scales[j+2] >> 0) & 0x0f0f) | ((scales[j-2] & 0xc0c0) >> 2);
-        aux[1] = ((scales[j+2] >> 4) & 0x0f0f) | ((scales[j-0] & 0xc0c0) >> 2);
-    }
-    const uint8_t * sc = (const uint8_t *)aux;
-    const uint8_t * m  = sc + 2;
+    const uint8_t * s = bq5_K->scales;
+    uint8_t sc[4];
+    uint8_t m[4];
+
+    sc[0] = s[2*g + 0] & 63;
+    sc[1] = s[2*g + 1] & 63;
+    m[0]  = s[2*g + 4] & 63;
+    m[1]  = s[2*g + 5] & 63;
+
+    sc[2] = (s[2*g + 8] & 0xF) | ((s[2*g + 0] >> 6) << 4);
+    sc[3] = (s[2*g + 9] & 0xF) | ((s[2*g + 1] >> 6) << 4);
+    m[2]  = (s[2*g + 8] >> 4) | ((s[2*g + 4] >> 6) << 4);
+    m[3]  = (s[2*g + 9] >> 4) | ((s[2*g + 5] >> 6) << 4);
 
 #pragma unroll
-    for (int i = 0; i < QR5_K; ++i) {
-        const block_q8_1 * bq8i = bq8_1 + bq8_offset + i;
+    for (int i = 0; i < 2*QR5_K; ++i) {
+        const int sb = 2*g + i + 2*(i >> 1);
+        const block_q8_1 * bq8i = bq8_1 + sb;
         d8[i] = __low2float(bq8i->ds);
-
-        const int * q8 = (const int *)bq8i->qs + ((iqs/2)%4);
-        u[2*i+0] = q8[0];
-        u[2*i+1] = q8[4];
+        u[i]  = ((const int *) bq8i->qs)[r];
     }
 
     return vec_dot_q5_K_q8_1_impl_vmmq(vl, vh, u, sc, m, bq5_K->dm, d8);
